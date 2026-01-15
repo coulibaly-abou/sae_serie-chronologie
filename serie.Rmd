@@ -1,0 +1,967 @@
+---
+title: "Untitled"
+author: "20/10/2025"
+date: "11/11/2025"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# =============================================================================
+# SAE 3.03 - Description et prévision de données temporelles
+# Analyse de la série ldeaths : décès mensuels par maladies pulmonaires (UK 1974-1979)
+# =============================================================================
+
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(trend)
+library(Kendall)
+library(feasts)
+library(fabletools)
+library(patchwork)
+library(gridExtra)
+library(ggridges)
+library(viridis)
+library(ggcorrplot)
+library(randomForest)
+library(caret)
+library(prophet)
+library(plotly)
+library(ggthemes)
+library(scales)
+library(moments)
+
+
+
+# === 3. Présentation et contextualisation des données ===
+cat("=== 3. PRÉSENTATION DES DONNÉES ===\n")
+data("ldeaths")
+ldeaths_ts <- ldeaths
+
+# Conversion en dataframe pour l'analyse
+time_index <- seq(from = as.Date("1974-01-01"), by = "1 month", length.out = length(ldeaths_ts))
+df <- tibble(
+  date = time_index,
+  deaths = as.numeric(ldeaths_ts),
+  year = year(date),
+  month = month(date, label = TRUE, abbr = FALSE),
+  month_num = month(date),
+  quarter = quarter(date),
+  season = case_when(
+    month_num %in% c(12, 1, 2) ~ "Hiver",
+    month_num %in% c(3, 4, 5) ~ "Printemps",
+    month_num %in% c(6, 7, 8) ~ "Été",
+    month_num %in% c(9, 10, 11) ~ "Automne"
+  )
+)
+
+cat("Source: 'P. J. Diggle (1990) Time Series: A Biostatistical Introduction. Oxford, table A.3', A time series giving the monthly deaths from bronchitis, emphysema and asthma in the UK, 1974-1979, both sexes\n")
+cat("Période:", format(min(df$date), "%Y-%m"), "à", format(max(df$date), "%Y-%m"), "\n")
+cat("Unité: Nombre de décès mensuels\n")
+cat("Variables: Bronchite, emphysème, asthme (tous sexes)\n")
+cat("Saisonnalité: Forte saisonnalité hivernale attendue\n\n")
+
+```
+
+
+```{r}
+# === 4. Exploration des données ===
+cat("=== 4. EXPLORATION DES DONNÉES ===\n")
+
+# 4.1 Descripteurs statistiques
+desc_stats <- df %>%
+  summarise(
+    Observations = n(),
+    Moyenne = round(mean(deaths), 1),
+    Médiane = median(deaths),
+    Écart_type = round(sd(deaths), 1),
+    CV = round(sd(deaths)/mean(deaths), 3),
+    Minimum = min(deaths),
+    Maximum = max(deaths),
+    Q1 = quantile(deaths, 0.25),
+    Q3 = quantile(deaths, 0.75),
+    Asymétrie = round(skewness(deaths), 3),
+    Aplatissement = round(kurtosis(deaths), 3)
+  )
+print(desc_stats)
+view(desc_stats)
+```
+
+
+```{r}
+# Statistiques par saison
+seasonal_stats <- df %>%
+  group_by(season) %>%
+  summarise(
+    Moyenne = round(mean(deaths), 1),
+    Médiane = median(deaths),
+    Écart_type = round(sd(deaths), 1),
+    n = n()
+  ) %>%
+  arrange(factor(season, levels = c("Hiver", "Printemps", "Été", "Automne")))
+print(seasonal_stats)
+```
+
+
+```{r}
+# STATISTIQUES DÉTAILLÉES PAR ANNÉE
+cat("\n--- STATISTIQUES DÉTAILLÉES PAR ANNÉE ---\n")
+annual_detailed <- df %>%
+  group_by(year) %>%
+  summarise(
+    Total_Décès = sum(deaths),
+    Moyenne_Mensuelle = round(mean(deaths), 1),
+    Médiane = median(deaths),
+    Écart_Type = round(sd(deaths), 1),
+    Minimum = min(deaths),
+    Maximum = max(deaths),
+    Amplitude = max(deaths) - min(deaths)
+  )
+print(annual_detailed)
+
+# 4.2 VISUALISATIONS
+
+# 4.2.1.1 Timeline avec événements saisonniers
+p_timeline <- ggplot(df, aes(x = date, y = deaths)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(aes(color = season), size = 2) +
+  geom_vline(xintercept = as.numeric(df$date[df$month_num == 1]), 
+             linetype = "dashed", alpha = 0.3) +
+  scale_color_viridis_d() +
+  labs(title = "Timeline des décès avec marqueurs saisonniers",
+       subtitle = "Lignes verticales = début d'année",
+       x = "Date", y = "Décès", color = "Saison") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_timeline)
+
+# 4.2.1.2 Série temporelle avec tendance et intervalle de confiance
+p1 <- ggplot(df, aes(x = date, y = deaths)) +
+  geom_ribbon(aes(ymin = deaths - sd(deaths), ymax = deaths + sd(deaths)), 
+              fill = "steelblue", alpha = 0.2) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(size = 1.5, color = "darkblue", alpha = 0.7) +
+  geom_smooth(method = "loess", color = "red", se = TRUE, linetype = "dashed") +
+  labs(title = "Évolution temporelle des décès pulmonaires avec tendance",
+       subtitle = "Royaume-Uni 1974-1979 - Intervalle de confiance à 1 écart-type",
+       x = "Date", y = "Nombre de décès mensuels") +
+  theme_minimal() +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10))
+print(p1)
+
+# 4.2.2 Heatmap annuelle des décès
+p_heatmap <- ggplot(df, aes(x = month, y = factor(year), fill = deaths)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_viridis(name = "Décès", option = "plasma") +
+  labs(title = "Heatmap des décès par mois et année",
+       subtitle = "Visualisation matricielle de la saisonnalité",
+       x = "Mois", y = "Année") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"))
+print(p_heatmap)
+
+# 4.2.3 Distribution par saison
+p_ridges <- ggplot(df, aes(x = deaths, y = season, fill = season)) +
+  geom_density_ridges(alpha = 0.7, scale = 0.9) +
+  scale_fill_viridis_d(option = "magma") +
+  labs(title = "Distribution des décès par saison",
+       subtitle = "Densité de probabilité - Pics hivernaux marqués",
+       x = "Nombre de décès", y = "Saison") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_ridges)
+
+# Violin plot par saison
+p_violin <- ggplot(df, aes(x = season, y = deaths, fill = season)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white", alpha = 0.5) +
+  geom_jitter(width = 0.1, alpha = 0.5, size = 1) +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution violon des décès par saison",
+       subtitle = "Combinaison boxplot et densité",
+       x = "Saison", y = "Décès") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "none")
+print(p_violin)
+```
+
+
+```{r}
+# 4.2.4 Boxplot par mois avec annotations
+p_boxplot <- ggplot(df, aes(x = month, y = deaths, fill = month)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, fill = "red") +
+  scale_fill_viridis_d() +
+  labs(title = "Distribution mensuelle des décès",
+       subtitle = "Points rouges = moyennes mensuelles",
+       x = "Mois", y = "Décès") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"),
+        legend.position = "none")
+print(p_boxplot)
+
+# 4.2.5 Radial plot
+p_radial <- ggplot(df, aes(x = month_num, y = deaths, group = year, color = year)) +
+  geom_line(linewidth = 1.2, alpha = 0.8) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  scale_color_viridis_c(name = "Année") +
+  coord_polar() +
+  labs(title = "Diagramme radial - Profil saisonnier annuel",
+       subtitle = "Évolution cyclique des décès pulmonaires",
+       x = "", y = "Décès") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_radial)
+```
+
+
+```{r}
+# 4.2.6 ACF et PACF avec seuils
+p_acf <- ggAcf(ldeaths_ts, lag.max = 36) + 
+  labs(title = "Fonction d'autocorrélation (ACF) - 36 lags",
+       subtitle = "Saisonnalité marquée aux lags 12, 24, 36") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_acf)
+
+p_pacf <- ggPacf(ldeaths_ts, lag.max = 36) + 
+  labs(title = "Fonction d'autocorrélation partielle (PACF)",
+       subtitle = "Identification des composantes AR") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+print(p_pacf)
+
+# 4.3 Analyse de corrélation temporelle
+# Création de lags pour l'analyse
+lag_analysis <- df %>%
+  mutate(
+    lag1 = lag(deaths, 1),
+    lag12 = lag(deaths, 12),
+    rolling_mean = zoo::rollmean(deaths, 12, fill = NA, align = "right")
+  )
+
+cor_matrix <- lag_analysis %>% 
+  select(deaths, lag1, lag12, rolling_mean) %>% 
+  na.omit() %>% 
+  cor()
+
+p_corr <- ggcorrplot(cor_matrix, 
+                     method = "circle",
+                     colors = c("blue", "white", "red"),
+                     title = "Matrice de corrélation temporelle") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p_corr)
+```
+
+
+```{r}
+# === 5. Tests statistiques APPROFONDIS ===
+cat("=== 5. TESTS STATISTIQUES APPROFONDIS ===\n")
+
+# 5.1 Test de stationnarité (Dickey-Fuller augmenté)
+cat("--- Test de Dickey-Fuller Augmenté ---\n")
+adf_test <- adf.test(ldeaths_ts)
+print(adf_test)
+
+# Test KPSS pour confirmation
+cat("\n--- Test KPSS ---\n")
+kpss_test <- kpss.test(ldeaths_ts)
+print(kpss_test)
+
+# 5.2 Test de tendance (Mann-Kendall)
+cat("\n--- Test de Mann-Kendall ---\n")
+mk_test <- MannKendall(ldeaths_ts)
+print(mk_test)
+
+# 5.3 Test de Pettitt pour rupture
+cat("\n--- Test de Pettitt ---\n")
+pettitt_test <- pettitt.test(ldeaths_ts)
+print(pettitt_test)
+
+# 5.4 Test de saisonnalité
+cat("\n--- Test de saisonnalité Kruskal-Wallis ---\n")
+kruskal_test <- kruskal.test(deaths ~ month, data = df)
+print(kruskal_test)
+
+# Visualisation des tests
+p_tests <- ggplot(df, aes(x = date, y = deaths)) +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_smooth(method = "loess", color = "red", se = TRUE, span = 0.3) +
+  geom_smooth(method = "lm", color = "green", se = FALSE, linetype = "dashed") +
+  labs(title = paste("Analyse de tendance - Mann-Kendall p =", round(mk_test$sl, 4),
+                     "- ADF p =", round(adf_test$p.value, 4)),
+       subtitle = "Rouge: tendance LOESS, Vert: tendance linéaire",
+       x = "Date", y = "Décès") +
+  theme_minimal()
+
+if(pettitt_test$p.value < 0.05) {
+  rupture_date <- df$date[pettitt_test$estimate]
+  p_tests <- p_tests + 
+    geom_vline(xintercept = rupture_date, color = "orange", 
+               linetype = "dashed", linewidth = 1) +
+    annotate("text", x = rupture_date, y = max(df$deaths), 
+             label = paste("Rupture", format(rupture_date, "%b %Y")), 
+             hjust = -0.1, color = "orange")
+}
+print(p_tests)
+```
+
+
+```{r}
+# === 6. Décomposition de la série ===
+cat("=== 6. DÉCOMPOSITION DE LA SÉRIE ===\n")
+
+# Analyse pour choisir entre additif et multiplicatif
+cat("--- Analyse du choix additif vs multiplicatif ---\n")
+
+# Calcul de la variance par rapport à la tendance
+var_analysis <- df %>%
+  mutate(
+    rolling_mean = zoo::rollmean(deaths, 12, fill = NA, align = "center"),
+    residus_add = deaths - rolling_mean,
+    residus_mult = deaths / rolling_mean
+  ) %>%
+  summarise(
+    var_residus_add = var(residus_add, na.rm = TRUE),
+    var_residus_mult = var(residus_mult, na.rm = TRUE),
+    cv_global = sd(deaths) / mean(deaths)
+  )
+
+print(var_analysis)
+
+# Règle de décision : si le coefficient de variation > 0.1, multiplicatif
+if(var_analysis$cv_global > 0.1) {
+  type_decomposition <- "multiplicative"
+  cat("Choix: Modèle MULTIPLICATIF (CV =", round(var_analysis$cv_global, 3), "> 0.1)\n")
+} else {
+  type_decomposition <- "additive" 
+  cat("Choix: Modèle ADDITIF (CV =", round(var_analysis$cv_global, 3), "<= 0.1)\n")
+}
+cat('Modèle choisi est', type_decomposition)
+```
+
+
+```{r}
+# 6.1 DÉCOMPOSITION CLASSIQUE (additive et multiplicative)
+decomp_additive <- decompose(ldeaths_ts, type = "additive")
+decomp_multiplicative <- decompose(ldeaths_ts, type = "multiplicative")
+```
+
+
+```{r}
+# 6.2 VISUALISATION COMPARATIVE DES DEUX DÉCOMPOSITIONS
+
+# Fonction pour créer les graphiques de décomposition
+create_decomp_plot <- function(decomp_obj, title, type) {
+  # Extraction des composantes
+  trend <- decomp_obj$trend
+  seasonal <- decomp_obj$seasonal
+  random <- decomp_obj$random
+  observed <- decomp_obj$x
+  
+  # Création du dataframe pour ggplot
+  decomp_df <- data.frame(
+    Date = time(observed),
+    Observée = as.numeric(observed),
+    Tendance = as.numeric(trend),
+    Saisonnalité = as.numeric(seasonal),
+    Aléatoire = as.numeric(random)
+  ) %>%
+    pivot_longer(cols = -Date, names_to = "Composante", values_to = "Valeur") %>%
+    mutate(Composante = factor(Composante, 
+                               levels = c("Observée", "Tendance", "Saisonnalité", "Aléatoire")))
+  
+  ggplot(decomp_df, aes(x = Date, y = Valeur)) +
+    geom_line(color = "steelblue", linewidth = 0.8) +
+    facet_wrap(~ Composante, ncol = 1, scales = "free_y") +
+    labs(title = title,
+         subtitle = paste("Type:", type),
+         x = "Date", y = "Valeur") +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+}
+
+# Graphiques comparatifs
+p_decomp_add <- create_decomp_plot(decomp_additive, 
+                                   "Décomposition Additive de la série ldeaths",
+                                   "Additive")
+
+p_decomp_mult <- create_decomp_plot(decomp_multiplicative,
+                                    "Décomposition Multiplicative de la série ldeaths", 
+                                    "Multiplicative")
+
+print(p_decomp_add)
+print(p_decomp_mult)
+```
+
+
+```{r}
+# 6.3 COMPARAISON DES RÉSIDUS
+residus_add <- na.omit(decomp_additive$random)
+residus_mult <- na.omit(decomp_multiplicative$random)
+
+comparaison_residus <- data.frame(
+  Type = c("Additif", "Multiplicatif"),
+  Variance = c(var(residus_add), var(residus_mult)),
+  Écart_Type = c(sd(residus_add), sd(residus_mult)),
+  Moyenne_Absolue = c(mean(abs(residus_add)), mean(abs(residus_mult)))
+)
+
+cat("\n--- Comparaison des résidus ---\n")
+print(comparaison_residus)
+```
+
+
+```{r}
+# 6.4 DÉCOMPOSITION CHOISIE (selon l'analyse)
+if(type_decomposition == "additive") {
+  decomp_choisie <- decomp_additive
+  cat("\n Modèle ADDITIF retenu pour l'analyse\n")
+} else {
+  decomp_choisie <- decomp_multiplicative
+  cat("\n Modèle MULTIPLICATIF retenu pour l'analyse\n")
+}
+
+# Extraction des composantes du modèle choisi
+tendance <- decomp_choisie$trend
+saisonnalite <- decomp_choisie$seasonal
+residus <- decomp_choisie$random
+# 6.5 CALCUL DES COEFFICIENTS SAISONNIERS
+if(type_decomposition == "additive") {
+  coefficients_saisonniers <- tapply(saisonnalite, cycle(ldeaths_ts), mean, na.rm = TRUE)
+  cat("\n--- Coefficients saisonniers (ADDITIF) ---\n")
+} else {
+  coefficients_saisonniers <- tapply(saisonnalite, cycle(ldeaths_ts), mean, na.rm = TRUE)
+  cat("\n--- Coefficients saisonniers (MULTIPLICATIF) ---\n")
+}
+
+coefficients_df <- data.frame(
+  Mois = month.abb,
+  Coefficient = round(coefficients_saisonniers, 3),
+  Pourcentage = if(type_decomposition == "multiplicative") {
+    round((coefficients_saisonniers - 1) * 100, 1)
+  } else {
+    round(coefficients_saisonniers / mean(ldeaths_ts, na.rm = TRUE) * 100, 1)
+  }
+)
+print(coefficients_df)
+
+# Visualisation des coefficients saisonniers
+p_coefficients <- ggplot(coefficients_df, aes(x = factor(Mois, levels = month.abb), y = Coefficient)) +
+  geom_col(fill = "coral", alpha = 0.8) +
+  geom_hline(yintercept = if(type_decomposition == "multiplicative") 1 else 0, 
+             linetype = "dashed", color = "red") +
+  labs(title = paste("Coefficients saisonniers - Modèle", type_decomposition),
+       x = "Mois", y = "Coefficient saisonnier") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"))
+
+print(p_coefficients)
+
+# 6.6 SÉRIE CORRIGÉE DES VARIATIONS SAISONNIÈRES (CVS)
+if(type_decomposition == "additive") {
+  cvs <- ldeaths_ts - saisonnalite
+  cat("\nSérie CVS = Série originale - Composante saisonnière\n")
+} else {
+  cvs <- ldeaths_ts / saisonnalite
+  cat("\nSérie CVS = Série originale / Composante saisonnière\n")
+}
+
+# 6.7 VISUALISATION SÉRIE ORIGINALE vs CVS - CORRIGÉE
+# Conversion des séries ts en vecteurs numériques avec dates
+df_cvs <- data.frame(
+  Date = df$date,
+  Originale = as.numeric(ldeaths_ts),
+  CVS = as.numeric(cvs),
+  Tendance = as.numeric(tendance)
+)
+
+p_cvs_comparison <- ggplot(df_cvs) +
+  geom_line(aes(x = Date, y = Originale, color = "Originale"), linewidth = 0.7, alpha = 0.7) +
+  geom_line(aes(x = Date, y = CVS, color = "CVS"), linewidth = 0.9, linetype = "solid") +
+  geom_line(aes(x = Date, y = Tendance, color = "Tendance"), linewidth = 1.2, linetype = "dashed") +
+  scale_color_manual(values = c("Originale" = "steelblue", "CVS" = "darkgreen", "Tendance" = "red")) +
+  labs(title = "Série originale vs Série CVS (Corrigée des Variations Saisonnières)",
+       subtitle = paste("Modèle", type_decomposition, "- La série CVS révèle la tendance sous-jacente"),
+       x = "Date", y = "Décès", color = "Série") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+print(p_cvs_comparison)
+
+# 6.8 ANALYSE DE LA SAISONNALITÉ
+cat("\n--- ANALYSE DE LA SAISONNALITÉ ---\n")
+
+# Mois avec la plus forte et plus faible saisonnalité
+mois_max <- coefficients_df[which.max(coefficients_df$Coefficient), ]
+mois_min <- coefficients_df[which.min(coefficients_df$Coefficient), ]
+
+cat("Mois de plus forte saisonnalité:", mois_max$Mois, 
+    "(Coefficient:", mois_max$Coefficient, ")\n")
+cat("Mois de plus faible saisonnalité:", mois_min$Mois,
+    "(Coefficient:", mois_min$Coefficient, ")\n")
+
+if(type_decomposition == "multiplicative") {
+  amplitude_saisonniere <- (max(coefficients_df$Coefficient) - min(coefficients_df$Coefficient)) * 100
+  cat("Amplitude saisonnière:", round(amplitude_saisonniere, 1), "%\n")
+} else {
+  amplitude_saisonniere <- max(coefficients_df$Coefficient) - min(coefficients_df$Coefficient)
+  cat("Amplitude saisonnière:", round(amplitude_saisonniere, 1), "décès\n")
+}
+
+
+# 6.11 SAUVEGARDE DES COMPOSANTES POUR LA SUITE
+# Création d'un dataframe avec toutes les composantes
+df_decomposition <- data.frame(
+  Date = df$date,
+  Originale = as.numeric(ldeaths_ts),
+  Tendance = as.numeric(tendance),
+  Saisonnalite = as.numeric(saisonnalite),
+  Residus = as.numeric(residus),
+  CVS = as.numeric(cvs),
+  Type_Modèle = type_decomposition
+)
+
+print(head(df_decomposition))
+```
+
+
+```{r}
+# === 7. VALIDATION DU MODÈLE MULTIPLICATIF ===
+cat("=== 7. VALIDATION DU MODÈLE MULTIPLICATIF ===\n")
+
+# Utiliser les résidus de votre décomposition multiplicative
+residus_multiplicatif <- df_decomposition$Residus
+
+# Analyse approfondie des résidus du modèle multiplicatif
+residus_analysis <- function(residus, title_suffix = "") {
+  par(mfrow = c(2, 3))
+  
+  # Série temporelle des résidus
+  plot(residus, type = "l", main = paste("Résidus dans le temps", title_suffix),
+       ylab = "Résidu", col = "darkred")
+  abline(h = 1, col = "blue", lwd = 2)  # Dans un modèle multiplicatif, l'espérance est 1
+  grid()
+  
+  # Histogramme avec courbe normale
+  hist(residus, breaks = 15, col = "lightcoral", probability = TRUE,
+       main = paste("Distribution des résidus", title_suffix),
+       xlab = "Résidu")
+  curve(dnorm(x, mean = mean(residus, na.rm = TRUE), sd = sd(residus, na.rm = TRUE)), 
+        add = TRUE, col = "blue", lwd = 2)
+  
+  # Q-Q plot
+  qqnorm(residus, main = paste("Q-Q Plot", title_suffix))
+  qqline(residus, col = "red", lwd = 2)
+  
+  # ACF des résidus
+  acf(na.omit(residus), main = paste("ACF des résidus", title_suffix))
+  
+  # PACF des résidus
+  pacf(na.omit(residus), main = paste("PACF des résidus", title_suffix))
+  
+  # Test de Ljung-Box séquentiel
+  residus_clean <- na.omit(residus)
+  lb_pvalues <- sapply(1:6, function(lag) {
+    Box.test(residus_clean, lag = lag, type = "Ljung-Box")$p.value
+  })
+  plot(1:6, lb_pvalues, type = "b", col = "purple", lwd = 2,
+       main = paste("Ljung-Box p-values", title_suffix),
+       xlab = "Lag", ylab = "p-value")
+  abline(h = 0.05, col = "red", lty = 2)
+  
+  par(mfrow = c(1, 1))
+}
+
+# Application aux résidus du modèle multiplicatif
+residus_analysis(residus_multiplicatif, "(Modèle Multiplicatif)")
+
+# Tests statistiques des résidus multiplicatifs
+cat("--- Tests sur les résidus du modèle multiplicatif ---\n")
+residus_clean <- na.omit(residus_multiplicatif)
+cat("Shapiro-Wilk p-value:", shapiro.test(residus_clean[1:min(5000, length(residus_clean))])$p.value, "\n")
+cat("Ljung-Box (lag=12) p-value:", Box.test(residus_clean, lag = 12)$p.value, "\n")
+cat("Moyenne des résidus:", mean(residus_clean), "\n")
+cat("Écart-type des résidus:", sd(residus_clean), "\n")
+
+# Identification des valeurs mal ajustées
+cat("\n--- VALEURS MAL AJUSTÉES ---\n")
+# Seuil pour détecter les valeurs aberrantes (2 écarts-types)
+seuil <- 2 * sd(residus_clean, na.rm = TRUE)
+moyenne_residus <- mean(residus_clean, na.rm = TRUE)
+
+# Points où les résidus sont anormaux
+valeurs_mal_ajustees <- which(abs(residus_multiplicatif - moyenne_residus) > seuil)
+
+cat("Nombre de valeurs potentiellement mal ajustées:", length(valeurs_mal_ajustees), "\n")
+cat("Indices des valeurs mal ajustées:", valeurs_mal_ajustees, "\n")
+cat("Pourcentage des données mal ajustées:", round(length(valeurs_mal_ajustees)/length(residus_clean)*100, 2), "%\n")
+
+# Graphique des résidus avec points mal ajustés
+plot(residus_multiplicatif, type = "l", col = "gray", 
+     main = "Résidus du modèle multiplicatif avec valeurs mal ajustées",
+     ylab = "Résidu", xlab = "Temps")
+abline(h = moyenne_residus + seuil, col = "red", lty = 2, lwd = 2)
+abline(h = moyenne_residus - seuil, col = "red", lty = 2, lwd = 2)
+abline(h = moyenne_residus, col = "blue", lwd = 1)
+points(valeurs_mal_ajustees, residus_multiplicatif[valeurs_mal_ajustees], 
+       col = "red", pch = 19, cex = 1.2)
+legend("topright", legend = c("Résidus", "Seuil ±2 écarts-types", "Valeurs mal ajustées"),
+       col = c("gray", "red", "red"), lty = c(1, 2, NA), pch = c(NA, NA, 19))
+```
+
+
+```{r}
+# === 8. PRÉVISIONS À COURT TERME ===
+cat("=== 8. PRÉVISIONS À COURT TERME ===\n")
+
+# 8.1 MÉTHODE PARAMÉTRIQUE (tendance + saisonnalité)
+cat("--- 8.1 Méthode paramétrique (tendance + coefficients saisonniers) ---\n")
+
+# Modélisation paramétrique de la tendance avec vos composantes
+temps <- 1:length(ldeaths_ts)
+df_tendance <- data.frame(
+  temps = temps,
+  tendance = as.numeric(df_decomposition$Tendance)
+) %>% na.omit()
+
+# Régression polynomiale sur la tendance
+modele_tendance <- lm(tendance ~ poly(temps, 2), data = df_tendance)
+
+# Prévision de la tendance pour les 12 prochains mois
+future_temps <- (max(df_tendance$temps) + 1):(max(df_tendance$temps) + 12)
+pred_tendance <- predict(modele_tendance, newdata = data.frame(temps = future_temps))
+
+# Ajout de la composante saisonnière (12 derniers mois du modèle multiplicatif)
+saison_future <- tail(df_decomposition$Saisonnalite, 12)
+
+# Prévision finale : Tendance × Saisonnalité
+pred_parametrique <- pred_tendance * saison_future
+
+cat("Prévisions paramétriques (12 mois):\n")
+print(round(pred_parametrique, 1))
+```
+
+
+```{r}
+# 8.2 MÉTHODE DE LISSAGE EXPONENTIEL
+cat("\n--- 8.2 Méthode de lissage exponentiel ---\n")
+
+# Lissage exponentiel de Holt-Winters
+modele_hw <- HoltWinters(ldeaths_ts, seasonal = "multiplicative")
+pred_hw <- predict(modele_hw, n.ahead = 12)
+
+cat("Prévisions par lissage exponentiel (12 mois):\n")
+print(round(pred_hw, 1))
+
+# 8.3 MODÈLE AUTORÉGRESSIF (ARIMA/SARIMA)
+cat("\n--- 8.3 Modèle autorégressif SARIMA ---\n")
+
+# Analyse ACF/PACF pour déterminer l'ordre
+par(mfrow = c(1, 2))
+acf(ldeaths_ts, main = "ACF - Série originale")
+pacf(ldeaths_ts, main = "PACF - Série originale")
+par(mfrow = c(1, 1))
+
+# Modèle SARIMA automatique
+modele_arima <- auto.arima(ldeaths_ts, seasonal = TRUE, 
+                          stepwise = TRUE, trace = TRUE)
+cat("Modèle SARIMA sélectionné:", arimaorder(modele_arima), "\n")
+
+pred_arima <- forecast(modele_arima, h = 12)
+
+cat("Prévisions SARIMA (12 mois):\n")
+print(round(pred_arima$mean, 1))
+```
+
+
+```{r}
+# 8.4 MACHINE LEARNING - RÉGRESSION AVEC VARIABLES TEMPORELLES
+cat("\n--- 8.4 Machine Learning - Régression avec features temporelles ---\n")
+
+# Préparation des données avec vos composantes
+df_ml <- df_decomposition %>%
+  mutate(
+    time_index = 1:n(),
+    lag1 = lag(Originale, 1),
+    lag2 = lag(Originale, 2),
+    lag12 = lag(Originale, 12),
+    month = as.factor(month(Date)),
+    trend_poly1 = time_index,
+    trend_poly2 = time_index^2
+  ) %>%
+  na.omit()
+
+# Division train/test (80/20)
+set.seed(123)
+train_index <- createDataPartition(df_ml$Originale, p = 0.8, list = FALSE)
+train_data <- df_ml[train_index, ]
+test_data <- df_ml[-train_index, ]
+
+# Modèle de régression avec validation croisée
+ctrl <- trainControl(method = "cv", number = 5)
+modele_ml <- train(
+  Originale ~ time_index + lag1 + lag12 + trend_poly1 + trend_poly2 + month,
+  data = train_data,
+  method = "glm",
+  family = gaussian(),
+  trControl = ctrl
+)
+```
+
+
+```{r}
+# Évaluation sur le test set
+predictions_test <- predict(modele_ml, newdata = test_data)
+rmse_ml <- RMSE(predictions_test, test_data$Originale)
+cat("RMSE Machine Learning:", round(rmse_ml, 2), "\n")
+
+# Prévisions pour les 12 prochains mois
+last_data <- tail(df_ml, 12)
+future_ml <- data.frame(
+  time_index = (max(df_ml$time_index) + 1):(max(df_ml$time_index) + 12),
+  lag1 = c(tail(df_ml$Originale, 1), rep(NA, 11)),
+  lag12 = rep(tail(df_ml$Originale, 12), 1),
+  trend_poly1 = (max(df_ml$time_index) + 1):(max(df_ml$time_index) + 12),
+  trend_poly2 = ((max(df_ml$time_index) + 1):(max(df_ml$time_index) + 12))^2,
+  month = as.factor(rep(1:12, 1))
+)
+
+# Propagation des valeurs lag1
+for(i in 2:12) {
+  if(is.na(future_ml$lag1[i])) {
+    future_ml$lag1[i] <- future_ml$lag1[i-1]
+  }
+}
+
+pred_ml <- predict(modele_ml, newdata = future_ml)
+
+cat("Prévisions Machine Learning (12 mois):\n")
+print(round(pred_ml, 1))
+```
+
+
+```{r}
+# COMPARAISON DES PRÉVISIONS
+cat("\n=== COMPARAISON DES MÉTHODES DE PRÉVISION ===\n")
+
+df_comparison_pred <- data.frame(
+  Mois = 1:12,
+  Paramétrique = round(pred_parametrique, 1),
+  Lissage = round(pred_hw, 1),
+  SARIMA = round(as.numeric(pred_arima$mean), 1),
+  MachineLearning = round(pred_ml, 1)
+)
+
+print(df_comparison_pred)
+
+# VISUALISATION COMPARATIVE DES PRÉVISIONS - MULTIPLES GRAPHIQUES
+# Création des données historiques de base
+df_historical_base <- data.frame(
+  Date = df$date,
+  Valeur = as.numeric(ldeaths_ts),
+  Type = "Historique"
+)
+
+# Création des données de prévision pour chaque méthode
+df_forecasts_param <- data.frame(
+  Date = seq(max(df$date) %m+% months(1), by = "month", length.out = 12),
+  Valeur = pred_parametrique,
+  Type = "Prévision",
+  Méthode = "Paramétrique"
+)
+
+df_forecasts_lissage <- data.frame(
+  Date = seq(max(df$date) %m+% months(1), by = "month", length.out = 12),
+  Valeur = as.numeric(pred_hw),
+  Type = "Prévision", 
+  Méthode = "Lissage"
+)
+
+df_forecasts_sarima <- data.frame(
+  Date = seq(max(df$date) %m+% months(1), by = "month", length.out = 12),
+  Valeur = as.numeric(pred_arima$mean),
+  Type = "Prévision",
+  Méthode = "SARIMA"
+)
+
+df_forecasts_ml <- data.frame(
+  Date = seq(max(df$date) %m+% months(1), by = "month", length.out = 12),
+  Valeur = pred_ml,
+  Type = "Prévision",
+  Méthode = "Machine Learning"
+)
+
+# Combinaison pour chaque méthode : historique + sa prévision spécifique
+df_param_complete <- bind_rows(
+  df_historical_base %>% mutate(Méthode = "Paramétrique"),
+  df_forecasts_param
+)
+
+df_lissage_complete <- bind_rows(
+  df_historical_base %>% mutate(Méthode = "Lissage"),
+  df_forecasts_lissage
+)
+
+df_sarima_complete <- bind_rows(
+  df_historical_base %>% mutate(Méthode = "SARIMA"),
+  df_forecasts_sarima
+)
+
+df_ml_complete <- bind_rows(
+  df_historical_base %>% mutate(Méthode = "Machine Learning"),
+  df_forecasts_ml
+)
+
+# Combinaison finale de toutes les données
+df_all_complete <- bind_rows(
+  df_param_complete,
+  df_lissage_complete,
+  df_sarima_complete,
+  df_ml_complete
+) %>%
+  mutate(Méthode = factor(Méthode, levels = c("Paramétrique", "Lissage", "SARIMA", "Machine Learning")),
+         Type = factor(Type, levels = c("Historique", "Prévision")))
+
+# Graphique avec sous-graphiques - Historique + Prévision sur chaque panel
+p_individual_with_history <- ggplot(df_all_complete, aes(x = Date, y = Valeur, color = Type, linetype = Type)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ Méthode, ncol = 2, scales = "free_y") +
+  scale_color_manual(values = c("Historique" = "steelblue", "Prévision" = "red")) +
+  scale_linetype_manual(values = c("Historique" = "solid", "Prévision" = "dashed")) +
+  labs(title = "Prévisions par méthode avec données historiques",
+       subtitle = "Chaque graphique montre l'historique complet + les prévisions de la méthode",
+       x = "Date", y = "Nombre de décès") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, color = "gray50"),
+        strip.text = element_text(face = "bold", size = 12),
+        strip.background = element_rect(fill = "lightgray", color = NA),
+        legend.position = "bottom")
+
+# Graphique zoomé sur la période récente pour chaque méthode
+recent_start <- max(df$date) %m-% months(24)  # 2 dernières années
+df_recent_complete <- df_all_complete %>% filter(Date >= recent_start)
+
+p_recent_individual <- ggplot(df_recent_complete, aes(x = Date, y = Valeur, color = Type, linetype = Type)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~ Méthode, ncol = 2) +
+  geom_vline(xintercept = max(df$date), linetype = "dashed", color = "gray50", alpha = 0.7) +
+  scale_color_manual(values = c("Historique" = "steelblue", "Prévision" = "red")) +
+  scale_linetype_manual(values = c("Historique" = "solid", "Prévision" = "dashed")) +
+  labs(title = "Zoom sur les 2 dernières années et prévisions",
+       subtitle = "Ligne pointillée = début des prévisions",
+       x = "Date", y = "Nombre de décès") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        strip.text = element_text(face = "bold"),
+        legend.position = "bottom")
+
+# Graphique comparatif global (toutes méthodes ensemble)
+df_historical_all <- df_historical_base %>% mutate(Méthode = "Historique")
+df_forecasts_all <- bind_rows(df_forecasts_param, df_forecasts_lissage, df_forecasts_sarima, df_forecasts_ml)
+
+p_global_comparison <- ggplot() +
+  geom_line(data = df_historical_all, aes(x = Date, y = Valeur, color = "Historique"), linewidth = 1) +
+  geom_line(data = df_forecasts_all, aes(x = Date, y = Valeur, color = Méthode, linetype = Méthode), linewidth = 0.8) +
+  scale_color_manual(values = c("Historique" = "black", 
+                               "Paramétrique" = "blue", 
+                               "Lissage" = "red", 
+                               "SARIMA" = "green", 
+                               "Machine Learning" = "purple")) +
+  scale_linetype_manual(values = c("Paramétrique" = "solid", 
+                                  "Lissage" = "dashed", 
+                                  "SARIMA" = "dotted", 
+                                  "Machine Learning" = "dotdash")) +
+  labs(title = "Vue comparative globale - Toutes les méthodes de prévision",
+       x = "Date", y = "Nombre de décès") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        legend.position = "bottom")
+
+# Affichage des graphiques
+print(p_individual_with_history)
+print(p_recent_individual)
+print(p_global_comparison)
+```
+
+
+```{r}
+# Statistiques comparatives des prévisions
+cat("\n=== STATISTIQUES DES PRÉVISIONS ===\n")
+stats_previsions <- data.frame(
+  Méthode = c("Paramétrique", "Lissage", "SARIMA", "Machine Learning"),
+  Moyenne = c(mean(pred_parametrique), mean(pred_hw), mean(pred_arima$mean), mean(pred_ml)),
+  Médiane = c(median(pred_parametrique), median(pred_hw), median(pred_arima$mean), median(pred_ml)),
+  Minimum = c(min(pred_parametrique), min(pred_hw), min(pred_arima$mean), min(pred_ml)),
+  Maximum = c(max(pred_parametrique), max(pred_hw), max(pred_arima$mean), max(pred_ml)),
+  Écart_Type = c(sd(pred_parametrique), sd(pred_hw), sd(pred_arima$mean), sd(pred_ml))
+)
+
+print(stats_previsions)
+```
+
+
+```{r}
+# === 9. SYNTHÈSE ET RECOMMANDATIONS DÉTAILLÉES ===
+cat("=== 9. SYNTHÈSE ET RECOMMANDATIONS ===\n")
+
+# VÉRIFICATION DE L'EXISTENCE DES GRAPHIQUES AVANT DE CRÉER LE DASHBOARD
+required_plots <- c("p1", "p_heatmap", "p_ridges", "p_boxplot", "p_comparison_advanced", "p_importance")
+existing_plots <- sapply(required_plots, function(x) exists(x))
+
+cat("Graphiques disponibles pour le dashboard:\n")
+print(existing_plots)
+
+# Création conditionnelle du tableau de bord
+library(patchwork)
+
+if (sum(existing_plots) >= 4) {
+  # Création d'un tableau de bord avec les graphiques disponibles
+  plot_list <- list()
+  
+  if (exists("p1")) plot_list[["p1"]] <- p1
+  if (exists("p_heatmap")) plot_list[["p2"]] <- p_heatmap
+  if (exists("p_comparison_advanced")) plot_list[["p3"]] <- p_comparison_advanced
+  if (exists("p_importance")) plot_list[["p4"]] <- p_importance
+  if (exists("p_ridges")) plot_list[["p5"]] <- p_ridges
+  if (exists("p_boxplot")) plot_list[["p6"]] <- p_boxplot
+  
+  # Arrangement des graphiques disponibles
+  if (length(plot_list) >= 4) {
+    p_final_dashboard <- (plot_list[[1]] | plot_list[[2]]) / 
+      (plot_list[[3]] | plot_list[[4]]) +
+      plot_annotation(
+        title = "DASHBOARD COMPLET - Analyse des décès pulmonaires UK 1974-1979",
+        subtitle = "Étude épidémiologique temporelle avec prévisions multi-modèles",
+        theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+                      plot.subtitle = element_text(size = 14, hjust = 0.5))
+      )
+    
+    print(p_final_dashboard)
+  } else {
+    cat("Attention: Pas assez de graphiques pour créer le dashboard complet\n")
+    p_final_dashboard <- NULL
+  }
+} else {
+  cat("Attention: Graphiques insuffisants pour créer le dashboard\n")
+  p_final_dashboard <- NULL
+}
+```
+
